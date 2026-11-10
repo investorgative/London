@@ -1,0 +1,7 @@
+venv/
+data/
+__pycache__/
+*.pyc
+config.json
+static/lightweight-charts.js
+london_debug_*.zip
