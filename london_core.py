@@ -650,9 +650,9 @@ def ladder_zones(o, h, l, c, p):
     mint = int(p["zone_min_touches"])
     wk, flip, rec = float(p["zone_wick_weight"]), float(p["zone_flip_bonus"]), float(p["zone_recency"])
     edge = int(p.get("zone_edge_wicks", 1))
-    order = np.argsort(X)
+    order = np.argsort(X, kind="stable")
     Xs, Js, Ks = X[order], J[order], K[order]
-    wo = np.argsort(W)
+    wo = np.argsort(W, kind="stable")
     Ws, WJs = W[wo], WJ[wo]
     # candidate bands start on a FIXED log-price lattice (0.1 %), independent of the window,
     # so a new candle only changes the zones it really touches (stable, sustainable levels)
@@ -665,25 +665,35 @@ def ladder_zones(o, h, l, c, p):
     W0, W1 = np.searchsorted(Ws, A), np.searchsorted(Ws, B, "right")
     ok = (I1 - I0) >= max(2, mint)
     # every score term depends only on which reactions / wicks fall inside the band, so identical
-    # index ranges give identical candidates -> evaluate each unique range once (exact, ~10x faster)
+    # index ranges give identical candidates -> evaluate each unique range once (exact)
     keys = np.unique(np.stack([I0[ok], I1[ok], W0[ok], W1[ok]], axis=1), axis=0)
+    xs_l, js_l, ks_l = Xs.tolist(), Js.tolist(), Ks.tolist()
+    ws_l, wj_l = Ws.tolist(), WJs.tolist()
+    inner = {}  # (i0, i1) -> reaction stats (shared by all wick ranges)
     cands = []
     for i0, i1, w0, w1 in keys.tolist():
-        js = np.sort(Js[i0:i1])
-        distinct = 1 + int(np.count_nonzero(np.diff(js) > sep))
+        st = inner.get((i0, i1))
+        if st is None:
+            js = sorted(js_l[i0:i1])
+            distinct = 1
+            for q in range(1, len(js)):
+                if js[q] - js[q - 1] > sep:
+                    distinct += 1
+            ns = ks_l[i0:i1].count(-1)
+            nr = i1 - i0 - ns
+            st = (distinct, ns, nr, js[-1])
+            inner[(i0, i1)] = st
+        distinct, ns, nr, last = st
         if distinct < mint:
             continue
-        kinds = Ks[i0:i1]
-        ns = int((kinds == -1).sum())
-        nr = i1 - i0 - ns
         both = ns > 0 and nr > 0
-        touch = len(set(WJs[w0:w1].tolist()))
-        bot, top = float(Xs[i0]), float(Xs[i1 - 1])
+        touch = len(set(wj_l[w0:w1]))
+        bot, top = xs_l[i0], xs_l[i1 - 1]
         if edge and w1 > w0:
-            bot, top = min(bot, float(Ws[w0])), max(top, float(Ws[w1 - 1]))
+            bot, top = min(bot, ws_l[w0]), max(top, ws_l[w1 - 1])
         width_u = math.expm1(top - bot) / u
-        score = distinct + wk * touch + flip * both + rec * float(js[-1]) / n - lam * width_u
-        cands.append((score, bot, top, distinct, both, int(js[-1]), ns, nr))
+        score = distinct + wk * touch + flip * both + rec * float(last) / n - lam * width_u
+        cands.append((score, bot, top, distinct, both, int(last), ns, nr))
     cands.sort(key=lambda x: -x[0])
     acc = []
     ms = float(p.get("zone_min_score", -99))
@@ -691,7 +701,12 @@ def ladder_zones(o, h, l, c, p):
         if cd[0] < ms:
             break
         b, t = cd[1], cd[2]
-        if all(b - z[2] >= gap or z[1] - t >= gap for z in acc):
+        okz = True
+        for z in acc:
+            if not (b - z[2] >= gap or z[1] - t >= gap):
+                okz = False
+                break
+        if okz:
             acc.append(cd)
     acc.sort(key=lambda x: x[1])
     out = []

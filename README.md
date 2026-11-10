@@ -89,6 +89,12 @@ If January is installed in `~/january`, setup copies its candle cache, so only t
 history is downloaded. The first backtest of a new zone setting builds the zone cache (a few minutes on
 a Pi); every later run with that setting takes seconds.
 
+**Optimizer timing.** The first stage ("zones x/y · eta") computes every 4h zone rebuild of every zone
+variant in parallel on all cores. On a Pi 4 with 1000 days that is roughly 20–40 minutes the first time;
+the results are cached, so the next run skips straight to the combinations. For quicker experiments use
+fewer days, or set `"optimizer": {"zone_variants": 3}` (or `"include_zone_space": false` to keep
+the zones fixed and only tune the entry settings).
+
 Dashboard on your network: `http://<pi-ip>:8759`. The public trycloudflare URL is printed by
 `start.sh` and shown in the dashboard sidebar.
 

@@ -77,15 +77,18 @@ def max_lookback(cfg, base=None, extra=()):
     return max(list(lbs) + list(extra))
 
 
-def run_backtest(cfg, days, settings, params=None, progress=None):
+def run_backtest(cfg, days, settings, params=None, progress=None, workers=1):
     """params: optional custom common block (may contain "_sym": {sym: overrides})."""
     t0 = time.time()
     data, start, end = load_data(cfg, days, max_lookback(cfg, params), progress)
     trades, opens, charts, used = [], [], {}, {}
     syms = cfg["symbols"]
+    items = [(sym, core.params_for(cfg, sym, params), data[sym]["data"]) for sym in syms]
+    precompute_zones(items, start, (lambda st, x: progress(st, 0.3 + 0.5 * x)) if progress else None,
+                     pool_workers=workers, label="building zones")
     for n, sym in enumerate(syms):
         if progress:
-            progress("simulate " + sym + " (first run builds the zone cache)", 0.3 + n / len(syms) * 0.65)
+            progress("simulate " + sym, 0.8 + n / len(syms) * 0.18)
         p = core.params_for(cfg, sym, params)
         used[sym] = p
         r = core.run_symbol(sym, data[sym]["data"], p, cfg, start, data[sym]["funding"], collect_chart=True)
@@ -136,25 +139,104 @@ def lab_summary(trades, cfg, start, end):
     return out
 
 
+# ---------------------------------------------------------------- zone pre-computation
+# Every zone rebuild depends only on the 4h window that existed at that moment, so the whole zone
+# timeline can be computed in parallel chunks (identical keys / results to Engine._rebuild_zones).
+CHUNK = 150
+
+
+def zone_windows(d, p, start):
+    """the exact (cache key, window start, window end) list an Engine run from `start` will ask for.
+    returns (bar arrays, windows) or (None, []) when zones are not rebuilt on every 4h close."""
+    if int(p.get("zone_refresh", 1)) != 1 or not len(d["ts"]):
+        return None, []
+    ts = d["ts"]
+    bars = core.aggregate_4h(ts, d["o"], d["h"], d["l"], d["c"])
+    if not bars:
+        return None, []
+    arr = {k: np.array([b[k] for b in bars], dtype=float) for k in ("o", "h", "l", "c")}
+    t = np.array([int(b["t"]) for b in bars], dtype=np.int64)
+    step_from = int(start) - core.STEP_LEAD
+    step_from -= step_from % core.H4
+    npre = int(np.searchsorted(t, step_from))
+    lb = int(p.get("zone_lookback_days", 730)) * 6
+    wins = []
+
+    def add(n):
+        a = max(0, n - lb)
+        close = int(t[n - 1]) + core.H4
+        key = str(close) if n - a >= lb else f"{close}@{int(t[a])}"
+        wins.append((key, a, n))
+    if npre > 0:
+        add(npre)
+    for j in range(npre, len(t)):
+        add(j + 1)
+    arr["t"] = t
+    return arr, wins
+
+
+def _zone_chunk(job):
+    sym, p, gid, chunk = job
+    A = _G["bars"][gid]
+    out = []
+    for key, a, n in chunk:
+        out.append((key, core.ladder_zones(A["o"][a:n], A["h"][a:n], A["l"][a:n], A["c"][a:n], p)))
+    return gid, out
+
+
+def precompute_zones(items, start, progress=None, pool_workers=1, label="zones", stop_flag=None):
+    """items: list of (sym, params, 15m data). Fills the zone caches for everything a backtest from
+    `start` will need. Uses a process pool when pool_workers > 1 (CLI / optimizer only)."""
+    jobs, caches, total = [], {}, 0
+    _G.setdefault("bars", {})
+    for gid, (sym, p, d) in enumerate(items):
+        zc = core.ZoneCache(sym, p)
+        caches[gid] = zc
+        arr, wins = zone_windows(d, p, start)
+        if arr is None:
+            continue
+        miss = [w for w in wins if zc.get(w[0]) is None]
+        if not miss:
+            continue
+        _G["bars"][gid] = arr
+        for i in range(0, len(miss), CHUNK):
+            jobs.append((sym, p, gid, miss[i:i + CHUNK]))
+        total += len(miss)
+    if not jobs:
+        return
+    done, t0 = 0, time.time()
+
+    def note(gid, out):
+        nonlocal done
+        for k, z in out:
+            caches[gid].put(k, z)
+        done += len(out)
+        if progress:
+            el = time.time() - t0
+            eta = el / max(done, 1) * (total - done)
+            progress(f"{label} {done}/{total} · eta {eta / 60:.1f} min (cached for next time)", done / total)
+    if pool_workers > 1 and len(jobs) > 1:
+        ctx = mp.get_context("fork") if hasattr(os, "fork") else mp.get_context()
+        with ctx.Pool(min(pool_workers, len(jobs))) as pool:
+            for gid, out in pool.imap_unordered(_zone_chunk, jobs):
+                note(gid, out)
+                if stop_flag and stop_flag():
+                    pool.terminate()
+                    break
+    else:
+        for j in jobs:
+            gid, out = _zone_chunk(j)
+            note(gid, out)
+    for zc in caches.values():
+        zc.save()
+
+
 # ---------------------------------------------------------------- optimizer (per symbol)
 _G = {}
 
 
 def _init(data, cfg, split, start):
     _G["data"], _G["cfg"], _G["split"], _G["start"] = data, cfg, split, start
-
-
-def _zone_job(args):
-    """pre-compute one zone timeline (symbol x zone variant) into the disk cache."""
-    sym, p = args
-    try:
-        cfg = _G["cfg"]
-        q = dict(p)
-        q["setup_max_bars"] = 1  # irrelevant for zones; keeps the run cheap
-        core.run_symbol(sym, _G["data"][sym]["data"], q, cfg, _G["start"], None)
-        return {"sym": sym, "key": core.zone_key(p)}
-    except Exception as e:
-        return {"sym": sym, "error": str(e)}
 
 
 def _eval(job):
@@ -235,19 +317,13 @@ def optimize(cfg, days, combos, progress=None, stop_flag=None, lab=None, symbols
     workers = oc.get("workers") or max(1, (os.cpu_count() or 2))
     t0 = time.time()
     ctx = mp.get_context("fork") if hasattr(os, "fork") else mp.get_context()
-    # 1) zone timelines (cached on disk, shared by every combo that uses the same zone variant)
+    # 1) zone timelines: every rebuild of every zone variant, in parallel chunks on all cores
+    #    (cached on disk, shared by every combo that uses the same zone variant)
     _init(data, cfg, split, start)
-    zjobs = [(s, p) for s in syms for p in zv[s]]
-    with ctx.Pool(min(workers, len(zjobs)), initializer=_init, initargs=(data, cfg, split, start)) as pool:
-        for i, r in enumerate(pool.imap_unordered(_zone_job, zjobs)):
-            if progress:
-                progress(f"zones {i + 1}/{len(zjobs)} (cached for next time)", 0.3 + 0.2 * (i + 1) / len(zjobs))
-            if stop_flag and stop_flag():
-                pool.terminate()
-                break
-    core.ZoneCache._mem.clear()
-    for s, p in zjobs:  # load into memory so forked workers share them
-        core.ZoneCache(s, p)
+    items = [(s, p, data[s]["data"]) for s in syms for p in zv[s]]
+    precompute_zones(items, start, (lambda st, x: progress(st, 0.3 + 0.2 * x)) if progress else None,
+                     pool_workers=workers, label="zones", stop_flag=stop_flag)
+    _G.pop("bars", None)
     # 2) combos: every symbol gets its own search (BTC and SOL ladders differ)
     jobs = []
     per = max(1, combos // len(syms))
@@ -301,11 +377,10 @@ def optimize(cfg, days, combos, progress=None, stop_flag=None, lab=None, symbols
 
 def warm_cache(cfg, days, progress=None):
     data, start, end = load_data(cfg, days, max_lookback(cfg), progress)
-    for sym in cfg["symbols"]:
-        p = core.params_for(cfg, sym)
-        t = time.time()
-        core.run_symbol(sym, data[sym]["data"], p, cfg, start, None)
-        print(f"{sym}: zone cache ready ({time.time() - t:.0f}s)")
+    items = [(sym, core.params_for(cfg, sym), data[sym]["data"]) for sym in cfg["symbols"]]
+    w = cfg["optimizer"].get("workers") or (os.cpu_count() or 2)
+    precompute_zones(items, start, progress, pool_workers=w, label="building zones")
+    print("\nzone cache ready")
 
 
 if __name__ == "__main__":
@@ -356,7 +431,8 @@ if __name__ == "__main__":
             st["risk_pct"] = a.risk
         if a.balance:
             st["start_balance"] = a.balance
-        res = run_backtest(cfg, a.days or cfg["backtest"]["default_days"], st, progress=pr)
+        res = run_backtest(cfg, a.days or cfg["backtest"]["default_days"], st, progress=pr,
+                           workers=cfg["optimizer"].get("workers") or (os.cpu_count() or 2))
         core.save_json(BT_PATH, res)
         print()
         for k, acc in res["accounts"].items():
